@@ -1,319 +1,275 @@
 <?php
 /**
- * Plugin Name: GTMStack GitHub Deploy Trigger
- * Description: Safely triggers a GitHub Actions workflow_dispatch when WordPress posts are published (headless rebuild for static Next.js exports).
- * Version: 1.1.0
- * Author: GTMStack
+ * Plugin Name: WP GitHub Deploy Trigger
+ * Description: Triggers a GitHub Actions workflow_dispatch when a WordPress post is published/updated. Useful for static site rebuilds.
+ * Version: 1.0.0
+ * Author: Your Name (Template)
  * License: GPLv2 or later
  */
 
-if (!defined('ABSPATH')) { exit; }
+if (!defined('ABSPATH')) exit;
 
-/**
- * =========================
- * SAFETY-FIRST CONFIG MODEL
- * =========================
- * For best security, store the GitHub token in wp-config.php (NOT in the database):
- *
- *   define('GTMSTACK_GH_TOKEN', 'ghp_...');
- *
- * This plugin will refuse to dispatch if GTMSTACK_GH_TOKEN is not defined.
- */
+class WP_GitHub_Deploy_Trigger {
+  const OPTION_KEY = 'wpgdt_settings';
+  const NONCE_ACTION = 'wpgdt_save_settings';
 
-/** Option keys */
-const GTMSTACK_OPT = 'gtmstack_gh_deploy_settings';
+  public function __construct() {
+    add_action('admin_menu', [$this, 'add_admin_menu']);
+    add_action('admin_init', [$this, 'register_settings']);
 
-/** Defaults */
-function gtmstack_default_settings() {
-  return [
-    'owner'    => 'findlini67',
-    'repo'     => 'GTMStack_pro',
-    'workflow' => 'deploy.yml',   // filename under .github/workflows/
-    'ref'      => 'main',
-    'enabled'  => '0',            // start disabled until token present + user enables
-    'post_type'=> 'post',         // default: posts only
-    'also_on_update' => '0',       // optional: rebuild when published posts are updated
-  ];
-}
+    // Publish + optional update triggers
+    add_action('transition_post_status', [$this, 'maybe_trigger_on_publish'], 10, 3);
+    add_action('post_updated', [$this, 'maybe_trigger_on_update'], 10, 3);
 
-function gtmstack_get_settings() {
-  $defaults = gtmstack_default_settings();
-  $saved = get_option(GTMSTACK_OPT, []);
-  if (!is_array($saved)) $saved = [];
-  return array_merge($defaults, $saved);
-}
-
-/** Admin notice if token missing */
-function gtmstack_admin_notice_missing_token() {
-  if (!current_user_can('manage_options')) return;
-
-  $settings = gtmstack_get_settings();
-  if ($settings['enabled'] !== '1') return;
-
-  if (!defined('GTMSTACK_GH_TOKEN') || !GTMSTACK_GH_TOKEN) {
-    echo '<div class="notice notice-error"><p><strong>GTMStack GitHub Deploy Trigger:</strong> Enabled, but <code>GTMSTACK_GH_TOKEN</code> is missing. No dispatches will run. Add the token to <code>wp-config.php</code> or disable the plugin trigger in Settings.</p></div>';
-  }
-}
-add_action('admin_notices', 'gtmstack_admin_notice_missing_token');
-
-/** Register settings */
-function gtmstack_register_settings() {
-  register_setting('gtmstack_gh_deploy', GTMSTACK_OPT, [
-    'type' => 'array',
-    'sanitize_callback' => 'gtmstack_sanitize_settings',
-    'default' => gtmstack_default_settings(),
-  ]);
-}
-add_action('admin_init', 'gtmstack_register_settings');
-
-function gtmstack_sanitize_settings($input) {
-  $defaults = gtmstack_default_settings();
-  $out = [];
-
-  $out['owner'] = isset($input['owner']) ? sanitize_text_field($input['owner']) : $defaults['owner'];
-  $out['repo'] = isset($input['repo']) ? sanitize_text_field($input['repo']) : $defaults['repo'];
-  $out['workflow'] = isset($input['workflow']) ? sanitize_text_field($input['workflow']) : $defaults['workflow'];
-  $out['ref'] = isset($input['ref']) ? sanitize_text_field($input['ref']) : $defaults['ref'];
-
-  $out['post_type'] = isset($input['post_type']) ? sanitize_key($input['post_type']) : $defaults['post_type'];
-
-  $out['enabled'] = (!empty($input['enabled']) && $input['enabled'] === '1') ? '1' : '0';
-  $out['also_on_update'] = (!empty($input['also_on_update']) && $input['also_on_update'] === '1') ? '1' : '0';
-
-  // If token missing, force disabled for safety (user sees notice if they re-enable)
-  if ($out['enabled'] === '1' && (!defined('GTMSTACK_GH_TOKEN') || !GTMSTACK_GH_TOKEN)) {
-    $out['enabled'] = '0';
+    // Manual test button
+    add_action('admin_post_wpgdt_test_dispatch', [$this, 'handle_test_dispatch']);
   }
 
-  return array_merge($defaults, $out);
-}
+  /** ---------------------------
+   *  Settings / Admin UI
+   *  --------------------------*/
+  public function add_admin_menu() {
+    add_options_page(
+      'GitHub Deploy Trigger',
+      'GitHub Deploy Trigger',
+      'manage_options',
+      'wpgdt',
+      [$this, 'render_settings_page']
+    );
+  }
 
-/** Add settings page */
-function gtmstack_add_settings_page() {
-  add_options_page(
-    'GTMStack Deploy Trigger',
-    'GTMStack Deploy Trigger',
-    'manage_options',
-    'gtmstack-gh-deploy',
-    'gtmstack_render_settings_page'
-  );
-}
-add_action('admin_menu', 'gtmstack_add_settings_page');
+  public function register_settings() {
+    register_setting('wpgdt_group', self::OPTION_KEY, [$this, 'sanitize_settings']);
+  }
 
-function gtmstack_render_settings_page() {
-  if (!current_user_can('manage_options')) return;
+  public function sanitize_settings($input) {
+    $out = [];
 
-  $settings = gtmstack_get_settings();
-  $token_ok = (defined('GTMSTACK_GH_TOKEN') && GTMSTACK_GH_TOKEN);
+    $out['github_owner']  = sanitize_text_field($input['github_owner'] ?? '');
+    $out['github_repo']   = sanitize_text_field($input['github_repo'] ?? '');
+    $out['workflow_file'] = sanitize_text_field($input['workflow_file'] ?? 'deploy.yml');
+    $out['ref']           = sanitize_text_field($input['ref'] ?? 'main');
 
-  ?>
-  <div class="wrap">
-    <h1>GTMStack GitHub Deploy Trigger</h1>
+    $out['post_type'] = sanitize_text_field($input['post_type'] ?? 'post');
 
-    <p>This plugin triggers a GitHub Actions workflow (<code>workflow_dispatch</code>) whenever you publish a WordPress post, so your static Next.js site rebuilds automatically.</p>
+    $out['enable_publish'] = !empty($input['enable_publish']) ? 1 : 0;
+    $out['enable_update']  = !empty($input['enable_update']) ? 1 : 0;
 
-    <h2>1) Safest Token Setup (recommended)</h2>
-    <p>Add this line to <code>wp-config.php</code> (above <code>/* That's all, stop editing! */</code>):</p>
-    <pre><code>define('GTMSTACK_GH_TOKEN', 'YOUR_GITHUB_TOKEN');</code></pre>
-    <p><strong>Status:</strong> <?php echo $token_ok ? '<span style="color:green">Token detected</span>' : '<span style="color:#b00">Token NOT detected</span>'; ?></p>
+    // Optional: Only fire when post is publicly visible
+    $out['only_public'] = !empty($input['only_public']) ? 1 : 0;
 
-    <hr />
+    // Optional: rate-limit (seconds). Prevent accidental rapid triggers.
+    $out['min_interval_sec'] = max(0, intval($input['min_interval_sec'] ?? 0));
 
-    <form method="post" action="options.php">
-      <?php settings_fields('gtmstack_gh_deploy'); ?>
-      <?php $opt = GTMSTACK_OPT; ?>
+    return $out;
+  }
 
-      <table class="form-table" role="presentation">
-        <tr>
-          <th scope="row"><label for="<?php echo esc_attr($opt); ?>[owner]">GitHub owner</label></th>
-          <td><input class="regular-text" type="text" name="<?php echo esc_attr($opt); ?>[owner]" value="<?php echo esc_attr($settings['owner']); ?>" /></td>
-        </tr>
-        <tr>
-          <th scope="row"><label for="<?php echo esc_attr($opt); ?>[repo]">GitHub repo</label></th>
-          <td><input class="regular-text" type="text" name="<?php echo esc_attr($opt); ?>[repo]" value="<?php echo esc_attr($settings['repo']); ?>" /></td>
-        </tr>
-        <tr>
-          <th scope="row"><label for="<?php echo esc_attr($opt); ?>[workflow]">Workflow file</label></th>
-          <td>
-            <input class="regular-text" type="text" name="<?php echo esc_attr($opt); ?>[workflow]" value="<?php echo esc_attr($settings['workflow']); ?>" />
-            <p class="description">Example: <code>deploy.yml</code> (must exist in <code>.github/workflows/</code>).</p>
-          </td>
-        </tr>
-        <tr>
-          <th scope="row"><label for="<?php echo esc_attr($opt); ?>[ref]">Branch/ref</label></th>
-          <td><input class="regular-text" type="text" name="<?php echo esc_attr($opt); ?>[ref]" value="<?php echo esc_attr($settings['ref']); ?>" /></td>
-        </tr>
-        <tr>
-          <th scope="row"><label for="<?php echo esc_attr($opt); ?>[post_type]">Trigger on post type</label></th>
-          <td>
-            <input class="regular-text" type="text" name="<?php echo esc_attr($opt); ?>[post_type]" value="<?php echo esc_attr($settings['post_type']); ?>" />
-            <p class="description">Default: <code>post</code>. (Advanced: use <code>page</code> or a custom post type slug.)</p>
-          </td>
-        </tr>
-        <tr>
-          <th scope="row">Enable dispatch on publish</th>
-          <td>
-            <label>
-              <input type="checkbox" name="<?php echo esc_attr($opt); ?>[enabled]" value="1" <?php checked($settings['enabled'], '1'); ?> <?php disabled(!$token_ok); ?> />
-              Enabled (requires token in <code>wp-config.php</code>)
-            </label>
-          </td>
-        </tr>
-        <tr>
-          <th scope="row">Also trigger on updates</th>
-          <td>
-            <label>
-              <input type="checkbox" name="<?php echo esc_attr($opt); ?>[also_on_update]" value="1" <?php checked($settings['also_on_update'], '1'); ?> />
-              Trigger rebuild when an already-published post is updated
-            </label>
-          </td>
-        </tr>
-      </table>
+  public function render_settings_page() {
+    if (!current_user_can('manage_options')) return;
 
-      <?php submit_button('Save Settings'); ?>
-    </form>
+    $settings = get_option(self::OPTION_KEY, []);
+    $token_present = $this->get_github_token() ? true : false;
 
-    <hr />
+    ?>
+    <div class="wrap">
+      <h1>WP GitHub Deploy Trigger</h1>
+      <p>This plugin triggers a <code>workflow_dispatch</code> on GitHub Actions when posts are published (and optionally updated).</p>
 
-    <h2>2) Test Dispatch</h2>
-    <p>Use this to verify WordPress can trigger GitHub. It does not publish anything.</p>
-    <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
-      <input type="hidden" name="action" value="gtmstack_test_dispatch" />
-      <?php wp_nonce_field('gtmstack_test_dispatch'); ?>
-      <?php submit_button('Send Test Dispatch', 'secondary'); ?>
-    </form>
+      <h2>1) Safest token setup (recommended)</h2>
+      <p>Add this to <code>wp-config.php</code> (above <code>/* That's all, stop editing */</code>):</p>
+      <pre><code>define('WPGDT_GITHUB_TOKEN', 'YOUR_GITHUB_TOKEN');</code></pre>
+      <p><strong>Status:</strong> <?php echo $token_present ? '<span style="color:green;">Token detected</span>' : '<span style="color:#b00;">Token NOT detected</span>'; ?></p>
 
-    <h2>3) GitHub Workflow Requirement</h2>
-    <p>Your workflow file must include <code>workflow_dispatch</code>, e.g.:</p>
-    <pre><code>on:
+      <hr />
+
+      <form method="post" action="options.php">
+        <?php settings_fields('wpgdt_group'); ?>
+        <?php $val = function($k, $default='') use ($settings) { return esc_attr($settings[$k] ?? $default); }; ?>
+        <?php $chk = function($k) use ($settings) { return !empty($settings[$k]) ? 'checked' : ''; }; ?>
+
+        <table class="form-table" role="presentation">
+          <tr>
+            <th scope="row">GitHub owner</th>
+            <td><input name="<?php echo self::OPTION_KEY; ?>[github_owner]" value="<?php echo $val('github_owner'); ?>" class="regular-text" /></td>
+          </tr>
+          <tr>
+            <th scope="row">GitHub repo</th>
+            <td><input name="<?php echo self::OPTION_KEY; ?>[github_repo]" value="<?php echo $val('github_repo'); ?>" class="regular-text" /></td>
+          </tr>
+          <tr>
+            <th scope="row">Workflow file</th>
+            <td>
+              <input name="<?php echo self::OPTION_KEY; ?>[workflow_file]" value="<?php echo $val('workflow_file','deploy.yml'); ?>" class="regular-text" />
+              <p class="description">Example: <code>deploy.yml</code> (file must exist in <code>.github/workflows/</code>)</p>
+            </td>
+          </tr>
+          <tr>
+            <th scope="row">Branch/ref</th>
+            <td><input name="<?php echo self::OPTION_KEY; ?>[ref]" value="<?php echo $val('ref','main'); ?>" class="regular-text" /></td>
+          </tr>
+          <tr>
+            <th scope="row">Trigger on post type</th>
+            <td>
+              <input name="<?php echo self::OPTION_KEY; ?>[post_type]" value="<?php echo $val('post_type','post'); ?>" class="regular-text" />
+              <p class="description">Use <code>post</code>, <code>page</code>, or a custom post type slug.</p>
+            </td>
+          </tr>
+          <tr>
+            <th scope="row">Enable dispatch on publish</th>
+            <td><label><input type="checkbox" name="<?php echo self::OPTION_KEY; ?>[enable_publish]" <?php echo $chk('enable_publish'); ?> /> Enabled</label></td>
+          </tr>
+          <tr>
+            <th scope="row">Also trigger on updates</th>
+            <td><label><input type="checkbox" name="<?php echo self::OPTION_KEY; ?>[enable_update]" <?php echo $chk('enable_update'); ?> /> Trigger rebuild when already-published post is updated</label></td>
+          </tr>
+          <tr>
+            <th scope="row">Only for public posts</th>
+            <td><label><input type="checkbox" name="<?php echo self::OPTION_KEY; ?>[only_public]" <?php echo $chk('only_public'); ?> /> Only trigger when status is <code>publish</code></label></td>
+          </tr>
+          <tr>
+            <th scope="row">Minimum interval (seconds)</th>
+            <td>
+              <input name="<?php echo self::OPTION_KEY; ?>[min_interval_sec]" value="<?php echo $val('min_interval_sec','0'); ?>" class="small-text" />
+              <p class="description">Optional safety: prevents repeated triggers within N seconds.</p>
+            </td>
+          </tr>
+        </table>
+
+        <?php submit_button('Save Settings'); ?>
+      </form>
+
+      <hr />
+
+      <h2>2) Test Dispatch</h2>
+      <p>This sends a manual <code>workflow_dispatch</code> to verify GitHub connectivity. It does not publish anything.</p>
+      <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
+        <?php wp_nonce_field('wpgdt_test_dispatch'); ?>
+        <input type="hidden" name="action" value="wpgdt_test_dispatch" />
+        <?php submit_button('Send Test Dispatch', 'secondary'); ?>
+      </form>
+
+      <hr />
+
+      <h2>3) GitHub Workflow Requirement</h2>
+      <p>Your workflow file must include <code>workflow_dispatch</code>, e.g.:</p>
+      <pre><code>on:
   push:
     branches: ["main"]
   workflow_dispatch: {}</code></pre>
 
-  </div>
-  <?php
-}
-
-/** Admin-post handler for test dispatch */
-add_action('admin_post_gtmstack_test_dispatch', function() {
-  if (!current_user_can('manage_options')) wp_die('Forbidden', 403);
-  check_admin_referer('gtmstack_test_dispatch');
-
-  $settings = gtmstack_get_settings();
-  $result = gtmstack_dispatch_github($settings);
-
-  $redirect = add_query_arg([
-    'page' => 'gtmstack-gh-deploy',
-    'gtmstack_test' => $result['ok'] ? '1' : '0',
-    'gtmstack_code' => $result['code'],
-  ], admin_url('options-general.php'));
-
-  wp_safe_redirect($redirect);
-  exit;
-});
-
-/** Show test result notice */
-add_action('admin_notices', function() {
-  if (!current_user_can('manage_options')) return;
-  if (!isset($_GET['page']) || $_GET['page'] !== 'gtmstack-gh-deploy') return;
-  if (!isset($_GET['gtmstack_test'])) return;
-
-  $ok = ($_GET['gtmstack_test'] === '1');
-  $code = isset($_GET['gtmstack_code']) ? intval($_GET['gtmstack_code']) : 0;
-
-  if ($ok) {
-    echo '<div class="notice notice-success"><p><strong>GTMStack Deploy Trigger:</strong> Test dispatch sent successfully (HTTP ' . esc_html($code) . '). Check GitHub Actions.</p></div>';
-  } else {
-    echo '<div class="notice notice-error"><p><strong>GTMStack Deploy Trigger:</strong> Test dispatch failed (HTTP ' . esc_html($code) . '). Enable WP_DEBUG_LOG and check <code>wp-content/debug.log</code>.</p></div>';
-  }
-});
-
-/** Throttle to avoid double-fires */
-function gtmstack_throttle($key, $seconds = 30) {
-  $tkey = 'gtmstack_throttle_' . md5($key);
-  if (get_transient($tkey)) return true;
-  set_transient($tkey, time(), $seconds);
-  return false;
-}
-
-/** Dispatch helper */
-function gtmstack_dispatch_github($settings) {
-  if (!defined('GTMSTACK_GH_TOKEN') || !GTMSTACK_GH_TOKEN) {
-    error_log('[GTMStack Deploy] Missing GTMSTACK_GH_TOKEN; dispatch aborted.');
-    return ['ok' => false, 'code' => 0];
+    </div>
+    <?php
   }
 
-  $owner = $settings['owner'];
-  $repo = $settings['repo'];
-  $workflow = $settings['workflow'];
-  $ref = $settings['ref'];
+  /** ---------------------------
+   *  Triggers
+   *  --------------------------*/
+  public function maybe_trigger_on_publish($new_status, $old_status, $post) {
+    if (!is_object($post) || empty($post->ID)) return;
 
-  $url = sprintf('https://api.github.com/repos/%s/%s/actions/workflows/%s/dispatches', rawurlencode($owner), rawurlencode($repo), rawurlencode($workflow));
+    $settings = get_option(self::OPTION_KEY, []);
+    if (empty($settings['enable_publish'])) return;
 
-  $response = wp_remote_post($url, [
-    'timeout' => 15,
-    'headers' => [
-      'Authorization' => 'Bearer ' . GTMSTACK_GH_TOKEN,
-      'Accept'        => 'application/vnd.github+json',
-      'Content-Type'  => 'application/json',
-      'User-Agent'    => 'gtmstack-wp-plugin',
-    ],
-    'body' => wp_json_encode(['ref' => $ref]),
-  ]);
+    // only trigger when transitioning to publish
+    if ($old_status === 'publish' || $new_status !== 'publish') return;
 
-  if (is_wp_error($response)) {
-    error_log('[GTMStack Deploy] Dispatch error: ' . $response->get_error_message());
-    return ['ok' => false, 'code' => 0];
+    if (!$this->post_matches_settings($post, $settings)) return;
+    if (!$this->passes_rate_limit($post->ID, $settings)) return;
+
+    $this->dispatch_workflow($post, 'publish');
   }
 
-  $code = wp_remote_retrieve_response_code($response);
-  $body = wp_remote_retrieve_body($response);
+  public function maybe_trigger_on_update($post_ID, $post_after, $post_before) {
+    $settings = get_option(self::OPTION_KEY, []);
+    if (empty($settings['enable_update'])) return;
 
-  // GitHub returns 204 No Content on success for workflow_dispatch.
-  $ok = ($code >= 200 && $code < 300);
+    if (!is_object($post_after)) return;
+    if (!is_object($post_before)) return;
 
-  if (!$ok) {
-    error_log('[GTMStack Deploy] Dispatch failed. HTTP ' . $code . ' body=' . $body);
+    // Only if already published and still published
+    if ($post_before->post_status !== 'publish' || $post_after->post_status !== 'publish') return;
+
+    if (!$this->post_matches_settings($post_after, $settings)) return;
+    if (!empty($settings['only_public'])) {
+      if ($post_after->post_status !== 'publish') return;
+    }
+
+    if (!$this->passes_rate_limit($post_ID, $settings)) return;
+
+    $this->dispatch_workflow($post_after, 'update');
   }
 
-  return ['ok' => $ok, 'code' => $code];
-}
+  private function post_matches_settings($post, $settings) {
+    $wanted_type = $settings['post_type'] ?? 'post';
+    if (!empty($wanted_type) && $post->post_type !== $wanted_type) return false;
 
-/** Trigger on publish (transition to publish) */
-add_action('transition_post_status', function($new_status, $old_status, $post) {
-  if ($new_status !== 'publish') return;
+    if (!empty($settings['only_public']) && $post->post_status !== 'publish') return false;
 
-  $settings = gtmstack_get_settings();
-  if ($settings['enabled'] !== '1') return;
+    return true;
+  }
 
-  if (!is_object($post) || empty($post->ID)) return;
-  if ($post->post_type !== $settings['post_type']) return;
-  if (wp_is_post_revision($post->ID)) return;
-  if (defined('DOING_AUTOSAVE') && DOING_AUTOSAVE) return;
+  /** ---------------------------
+   *  Manual test
+   *  --------------------------*/
+  public function handle_test_dispatch() {
+    if (!current_user_can('manage_options')) wp_die('Unauthorized');
+    check_admin_referer('wpgdt_test_dispatch');
 
-  // Only when it becomes published
-  if ($old_status === 'publish') return;
+    $ok = $this->dispatch_workflow(null, 'test');
 
-  // Avoid duplicate calls
-  if (gtmstack_throttle('publish_' . $post->ID, 30)) return;
+    $redirect = add_query_arg([
+      'page' => 'wpgdt',
+      'wpgdt_test' => $ok ? 'ok' : 'fail',
+    ], admin_url('options-general.php'));
 
-  gtmstack_dispatch_github($settings);
-}, 10, 3);
+    wp_safe_redirect($redirect);
+    exit;
+  }
 
-/** Optional: trigger on updates to already published posts */
-add_action('post_updated', function($post_id, $post_after, $post_before) {
-  if (!is_object($post_after) || !is_object($post_before)) return;
+  /** ---------------------------
+   *  GitHub Dispatch
+   *  --------------------------*/
+  private function dispatch_workflow($post, $reason = 'publish') {
+    $token = $this->get_github_token();
+    if (!$token) {
+      $this->log('Missing GitHub token. Define WPGDT_GITHUB_TOKEN in wp-config.php.');
+      return false;
+    }
 
-  $settings = gtmstack_get_settings();
-  if ($settings['enabled'] !== '1') return;
-  if ($settings['also_on_update'] !== '1') return;
+    $settings = get_option(self::OPTION_KEY, []);
+    $owner = $settings['github_owner'] ?? '';
+    $repo  = $settings['github_repo'] ?? '';
+    $workflow_file = $settings['workflow_file'] ?? 'deploy.yml';
+    $ref = $settings['ref'] ?? 'main';
 
-  if ($post_after->post_status !== 'publish') return;
-  if ($post_before->post_status !== 'publish') return;
-  if ($post_after->post_type !== $settings['post_type']) return;
-  if (wp_is_post_revision($post_id)) return;
+    if (!$owner || !$repo || !$workflow_file) {
+      $this->log('Missing GitHub owner/repo/workflow_file settings.');
+      return false;
+    }
 
-  if (gtmstack_throttle('update_' . $post_id, 30)) return;
+    // GitHub API: Create a workflow dispatch event
+    $url = "https://api.github.com/repos/{$owner}/{$repo}/actions/workflows/{$workflow_file}/dispatches";
 
-  gtmstack_dispatch_github($settings);
-}, 10, 3);
+    // Optional inputs (useful for debugging later)
+    $inputs = [
+      'reason' => $reason,
+    ];
+
+    if ($post && is_object($post)) {
+      $inputs['wp_post_id'] = strval($post->ID);
+      $inputs['wp_post_type'] = strval($post->post_type);
+      $inputs['wp_post_status'] = strval($post->post_status);
+      $inputs['wp_post_slug'] = strval($post->post_name);
+    }
+
+    $body = wp_json_encode([
+      'ref' => $ref,
+      'inputs' => $inputs,
+    ]);
+
+    $args = [
+      'method'  => 'POST',
+      'timeout' => 15,
+      'headers' => [
+        'Accept'        => 'application/vnd.github+json',
+        'Authorization
